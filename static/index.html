@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python 实时对话运行器</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; min-height: 100vh;
+    background: #16181d; color: #d7dae0;
+    font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  h1 { font-size: 18px; margin: 0; }
+  h2 { font-size: 13px; margin: 0 0 6px; color: #9aa0aa; font-weight: 600; }
+  .card { background: #1e2128; border: 1px solid #2c313a; border-radius: 8px; padding: 12px; }
+  textarea {
+    width: 100%; height: 180px; resize: vertical;
+    background: #12141a; color: #e6e9ef; border: 1px solid #2c313a; border-radius: 6px;
+    font: 13px/1.5 "SF Mono", Consolas, "Courier New", monospace;
+    padding: 10px; tab-size: 4;
+  }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+  button {
+    background: #2b6cb0; color: #fff; border: 0; border-radius: 6px;
+    padding: 7px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #3182ce; }
+  button:disabled { background: #3a3f4a; color: #8a8f98; cursor: not-allowed; }
+  button.danger { background: #c0392b; }
+  button.danger:hover:not(:disabled) { background: #e74c3c; }
+  button.ex { background: #2c313a; }
+  button.ex:hover:not(:disabled) { background: #3a4150; }
+  #status { margin-top: 8px; font-size: 13px; color: #8fd3a0; min-height: 20px; }
+  #panes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; flex: 1; min-height: 220px; }
+  @media (max-width: 800px) { #panes { grid-template-columns: 1fr; } }
+  .pane pre {
+    margin: 0; height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+    background: #0d0f13; border: 1px solid #2c313a; border-radius: 6px; padding: 10px;
+    font: 13px/1.5 "SF Mono", Consolas, "Courier New", monospace;
+  }
+  #out { color: #b5e0b8; }
+  #err { color: #f0a8a0; }
+  #inputbar { display: flex; gap: 8px; }
+  #line {
+    flex: 1; background: #12141a; color: #e6e9ef; border: 1px solid #2c313a;
+    border-radius: 6px; padding: 8px 10px; font-size: 13px;
+  }
+  .hint { color: #7c828c; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐍 Python 实时对话运行器</h1>
+  <div class="hint">粘贴代码 → 运行 → 实时查看 stdout / stderr，可发送一行输入或关闭标准输入（EOF）。全站同时仅一个未结束运行；仅供本机可信代码使用。</div>
+</header>
+
+<section class="card">
+  <textarea id="code" spellcheck="false" placeholder="在此粘贴 Python 代码（仅标准库、不派生进程）"></textarea>
+  <div class="toolbar">
+    <button id="runBtn">▶ 运行</button>
+    <button id="termBtn" class="danger" disabled>■ 终止</button>
+    <span class="hint">示例：</span>
+    <button class="ex" data-ex="echo">等待输入</button>
+    <button class="ex" data-ex="streams">双路无换行输出</button>
+    <button class="ex" data-ex="eof">EOF</button>
+    <button class="ex" data-ex="loop">终止</button>
+  </div>
+  <div id="status">空闲</div>
+</section>
+
+<section id="panes">
+  <div class="pane card"><h2>标准输出 stdout</h2><pre id="out"></pre></div>
+  <div class="pane card"><h2>标准错误 stderr</h2><pre id="err"></pre></div>
+</section>
+
+<section id="inputbar" class="card">
+  <input id="line" placeholder="输入一行文本，回车或点击「发送」" disabled>
+  <button id="sendBtn" disabled>发送</button>
+  <button id="eofBtn" disabled>关闭标准输入 (EOF)</button>
+</section>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+// currentRunId + epoch 共同防止迟到回包混入新一轮页面：
+// 每次启动新运行 epoch 自增，旧轮次的响应到达时直接丢弃。
+let currentRunId = null;
+let epoch = 0;
+let lastSeq = 0;
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function setStatus(text) { $("status").textContent = text; }
+
+function setRunning(running) {
+  $("runBtn").disabled = running;
+  $("termBtn").disabled = !running;
+  $("sendBtn").disabled = !running;
+  $("eofBtn").disabled = !running;
+  $("line").disabled = !running;
+}
+
+function setStdinOpen(open) {
+  $("sendBtn").disabled = !open;
+  $("eofBtn").disabled = !open;
+  $("line").disabled = !open;
+}
+
+function appendText(el, text) {
+  el.appendChild(document.createTextNode(text));  // 未换行片段也直接追加
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderEvent(ev) {
+  if (ev.stream === "stdout") appendText($("out"), ev.data);
+  else if (ev.stream === "stderr") appendText($("err"), ev.data);
+  else if (ev.stream === "meta" && ev.data && "exit_code" in ev.data) {
+    setStatus("运行结束，退出码 = " + ev.data.exit_code + "（两路输出已排空，可重新运行）");
+  }
+}
+
+async function pollLoop(runId, myEpoch) {
+  while (myEpoch === epoch && currentRunId === runId) {
+    let res;
+    try {
+      res = await fetch(`/events?run_id=${runId}&after=${lastSeq}`);
+    } catch (e) {
+      await sleep(1000);
+      continue;
+    }
+    // 迟到回包检查：轮次或标识已变则丢弃
+    if (myEpoch !== epoch || currentRunId !== runId) return;
+    if (res.status === 409) return;  // 标识已失效（旧运行）
+    const data = await res.json();
+    if (data.run_id !== runId) return;
+    for (const ev of data.events) {
+      if (ev.seq <= lastSeq) continue;
+      lastSeq = ev.seq;
+      renderEvent(ev);
+    }
+    setStdinOpen(!data.stdin_closed);
+    if (data.status === "finished") {
+      setRunning(false);
+      setStdinOpen(false);
+      if (!data.events.some(e => e.stream === "meta")) {
+        setStatus("运行结束，退出码 = " + data.exit_code + "（两路输出已排空，可重新运行）");
+      }
+      return;
+    }
+  }
+}
+
+function adoptRun(runId) {
+  epoch++;
+  currentRunId = runId;
+  lastSeq = 0;
+  $("out").textContent = "";
+  $("err").textContent = "";
+  setRunning(true);
+  setStatus("运行中，run_id = " + runId.slice(0, 8) + "…");
+  pollLoop(runId, epoch);
+}
+
+async function startRun() {
+  const code = $("code").value;
+  if (!code.trim()) { setStatus("请先粘贴代码"); return; }
+  const res = await fetch("/run", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({code})
+  });
+  if (res.status === 409) {
+    const d = await res.json();
+    setStatus("无法启动：" + (d.error || "已有运行未结束"));
+    return;
+  }
+  const data = await res.json();
+  adoptRun(data.run_id);
+}
+
+async function sendLine() {
+  if (!currentRunId) return;
+  const line = $("line").value;
+  const res = await fetch("/input", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({run_id: currentRunId, line})
+  });
+  if (res.status === 409) {
+    const d = await res.json();
+    setStatus("写入被拒绝：" + (d.error || ""));
+    return;
+  }
+  $("line").value = "";
+  $("line").focus();
+}
+
+async function closeStdin() {
+  if (!currentRunId) return;
+  const res = await fetch("/stdin/close", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({run_id: currentRunId})
+  });
+  if (res.ok) {
+    setStdinOpen(false);
+    setStatus("标准输入已关闭（EOF），此后写入将被拒绝");
+  }
+}
+
+async function terminate() {
+  if (!currentRunId) return;
+  await fetch("/terminate", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({run_id: currentRunId})
+  });
+  setStatus("已发送 SIGKILL（不等程序自行退出），正在排空输出并回收进程…");
+}
+
+const EXAMPLES = {
+  echo: `# 示例 1：等待输入 —— 回声程序
+import sys
+
+print("你好，我是回声程序。输入一行，我原样返回；输入 quit 退出。")
+for line in sys.stdin:
+    line = line.rstrip("\\n")
+    if line == "quit":
+        print("再见！")
+        break
+    print("你说：" + line)
+`,
+  streams: `# 示例 2：双路无换行输出 —— 片段不丢字、不乱码
+import sys
+import time
+
+for i in range(6):
+    sys.stdout.write(f"输出{i}…")      # 不换行，立即刷新
+    sys.stdout.flush()
+    sys.stderr.write(f"错误{i}…")      # 另一路同样无换行
+    sys.stderr.flush()
+    time.sleep(0.5)
+print()
+print("完成", file=sys.stderr)
+`,
+  eof: `# 示例 3：EOF —— 关闭标准输入后程序统计收到的内容
+import sys
+
+print("请发送若干行，然后点击「关闭标准输入 (EOF)」。")
+data = sys.stdin.read()   # 阻塞直到 EOF
+print(f"共收到 {len(data)} 个字符，内容如下：")
+print(data)
+`,
+  loop: `# 示例 4：终止 —— 永不自行退出，只能点「终止」
+import time
+
+print("我将每秒打印一次，永不退出。请点击「终止」。")
+i = 0
+while True:
+    print(f"tick {i}", flush=True)
+    i += 1
+    time.sleep(1)
+`
+};
+
+for (const btn of document.querySelectorAll("button.ex")) {
+  btn.addEventListener("click", () => { $("code").value = EXAMPLES[btn.dataset.ex]; });
+}
+$("runBtn").addEventListener("click", startRun);
+$("termBtn").addEventListener("click", terminate);
+$("sendBtn").addEventListener("click", sendLine);
+$("eofBtn").addEventListener("click", closeStdin);
+$("line").addEventListener("keydown", e => { if (e.key === "Enter") sendLine(); });
+
+// 页面加载时若已有运行（例如刷新页面），接管它并从头回放输出
+(async () => {
+  try {
+    const res = await fetch("/status");
+    const data = await res.json();
+    if (data.state === "running") {
+      adoptRun(data.run_id);
+    } else if (data.state === "finished") {
+      setStatus("上一次运行已结束，退出码 = " + data.exit_code + "，可直接运行新代码");
+    }
+  } catch (e) { /* 忽略 */ }
+})();
+</script>
+</body>
+</html>
