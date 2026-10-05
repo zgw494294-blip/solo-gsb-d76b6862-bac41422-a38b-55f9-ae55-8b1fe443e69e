@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Python 实时对话运行器</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>🐍 Python 实时对话运行器</h1>
+    <div id="status" class="status idle">空闲</div>
+  </header>
+
+  <section class="editor">
+    <div class="toolbar">
+      <label for="examples">示例：</label>
+      <select id="examples">
+        <option value="echo">等待输入（回显对话）</option>
+        <option value="dual">双路无换行输出</option>
+        <option value="eof">EOF（读到底）</option>
+        <option value="loop">终止（忽略 SIGTERM 的死循环）</option>
+      </select>
+      <button id="loadExampleBtn" type="button">载入示例</button>
+      <span class="spacer"></span>
+      <button id="runBtn" type="button" class="primary">▶ 运行</button>
+      <button id="termBtn" type="button" class="danger" disabled>■ 终止</button>
+    </div>
+    <textarea id="code" spellcheck="false" placeholder="在此粘贴 Python 代码（仅标准库、不派生进程）"></textarea>
+  </section>
+
+  <section class="panes">
+    <div class="pane">
+      <h2>标准输出 <span class="tag stdout">stdout</span></h2>
+      <pre id="stdoutPane" class="output"></pre>
+    </div>
+    <div class="pane">
+      <h2>标准错误 <span class="tag stderr">stderr</span></h2>
+      <pre id="stderrPane" class="output"></pre>
+    </div>
+  </section>
+
+  <section class="stdin-bar">
+    <span class="prompt">stdin ›</span>
+    <input id="stdinLine" type="text" placeholder="输入一行文本，回车发送" disabled>
+    <button id="sendBtn" type="button" disabled>发送</button>
+    <button id="eofBtn" type="button" disabled>关闭标准输入 (EOF)</button>
+  </section>
+
+  <footer>
+    仅供本机可信代码使用 · 全站同时仅一个未结束运行 · 服务重启即清空状态
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
